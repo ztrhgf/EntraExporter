@@ -16,7 +16,7 @@
     The available types are:
         'AccessPolicies','AccessReviews','AdministrativeUnits','All','Applications','AppProxy','B2B','B2C','CloudPCRoles','ConditionalAccess','Config','Devices','Directory','DirectoryRoles','Domains','EntitlementManagement','EntitlementManagementRoles','ExchangeRoles','Governance','Groups','IAM','Identity','IntuneRoles','Organization','PIM','PIMDirectoryRoles','PIMGroups','PIMResources','Policies','Reports','RoleManagement','Roles','ServicePrincipals','Sharepoint','SKUs','Teams','Users','UsersRegisteredByFeatureReport'.
 
-    To see what each type exports, check src\Get-EEDefaultSchema.ps1 and check the 
+    To see what each type exports, check src\Get-EEDefaultSchema.ps1 and review the comments and schema definitions within that file for detailed information.
 
     .PARAMETER All
     If specified performs a full export of all objects and configuration in the tenant.
@@ -105,9 +105,9 @@
     )
 
     $mgContext = Get-MgContext
-
     if (!$mgContext) {
-        throw 'No active connection. Run Connect-EntraExporter or Connect-MgGraph to sign in and then retry.'
+        Write-Error 'No active connection. Run ''Connect-EntraExporter'' or ''Connect-MgGraph'' to sign in and then retry.'
+        return
     }
 
     if ($All) { $Type = @('All') }
