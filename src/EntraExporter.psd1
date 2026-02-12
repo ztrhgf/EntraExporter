@@ -73,6 +73,8 @@
         'internal\Search-AzGraph2.ps1'
         'internal\Get-MgGraphAllPages.ps1'
         'internal\Get-AzureDirectoryObject.ps1'
+        'internal\Invoke-FilePathCheck.ps1'
+        'internal/Invoke-RoleEligibilityScheduleRequestIdSimplification.ps1'
         'command\Get-AccessPackageAssignmentPolicies.ps1'
         'command\Get-AccessPackageAssignments.ps1'
         'command\Get-AccessPackageResourceScopes.ps1'

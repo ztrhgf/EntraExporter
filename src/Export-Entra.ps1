@@ -523,9 +523,8 @@
             $outputFileName = Join-Path (Join-Path -Path $outputFileName -ChildPath $itemId) -ChildPath "$itemId.json"
         }
 
-        if ($outputFileName.Length -gt 255 -and (Get-ItemPropertyValue HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem -Name LongPathsEnabled -ErrorAction SilentlyContinue) -ne 1) {
-            Write-Warning "Output file path '$outputFileName' is longer than 255 characters. Enable long path support to continue!"
-            return
+        if (!(Invoke-FilePathCheck -FilePath $outputFileName)) {
+            continue
         }
 
         $item | Select-Object * -ExcludeProperty RequestId | ConvertTo-Json -depth 100 | Out-File (New-Item -Path $outputFileName -Force)
