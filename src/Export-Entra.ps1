@@ -221,12 +221,80 @@
         }
     }
 
+    function _flushResultsToDisk {
+        <#
+        Writes each result item to disk immediately and records the item's Id in the
+        parent-ID index so that it can be used for children lookups later.
+        This keeps memory usage low: full objects are discarded after writing.
+        #>
+        param(
+            [array]$batchResults,
+            [hashtable]$parentIdIndex
+        )
+
+        foreach ($item in $batchResults) {
+            # --- populate parent-id index (only RequestId + Id needed afterwards) ---
+            $normalizedId = _normalizeRequestId $item.RequestId
+            if (!$parentIdIndex.ContainsKey($normalizedId)) {
+                $parentIdIndex[$normalizedId] = [System.Collections.Generic.List[string]]::new()
+            }
+            $indexId = Get-ObjectProperty $item 'Id'
+            if ($indexId) {
+                if (!$parentIdIndex[$normalizedId].Contains($indexId)) {
+                    $parentIdIndex[$normalizedId].Add($indexId)
+                }
+            }
+
+            # --- write item to disk ---
+            if (!(Get-ObjectProperty $item 'Id')) {
+                <#
+                In some special cases it can happen that 'id' property is missing like:
+
+                isEnabled             : True
+                notifyReviewers       : True
+                remindersEnabled      : False
+                requestDurationInDays : 14
+                version               : 0
+                reviewers             : {...}
+                RequestId             : C:/temp/bkp3/Policies/AdminConsentRequestPolicy
+                #>
+
+                $itemId = ($item.RequestId -split "/")[-1]
+                # remove the random number added to avoid duplicated ids in batch requests
+                $itemId = _normalizeRequestId $itemId
+
+                Write-Verbose ($item | convertto-json -WarningAction SilentlyContinue)
+                Write-Verbose "Result without 'id' property, using '$itemId' instead (RequestId '$($item.RequestId)')!"
+            } else {
+                $itemId = $item.id
+            }
+
+            if (!$item.RequestId) {
+                $item
+                Write-Warning "Item without RequestId. Shouldn't happen!"
+            }
+
+            $outputFileName = $item.RequestId -replace "/", "\"
+            # remove the random number added to avoid duplicated ids in batch requests
+            $outputFileName = _normalizeRequestId $outputFileName
+
+            if ($outputFileName -notmatch "\.json$") {
+                $outputFileName = Join-Path (Join-Path -Path $outputFileName -ChildPath $itemId) -ChildPath "$itemId.json"
+            }
+
+            if (!(Invoke-FilePathCheck -FilePath $outputFileName)) {
+                continue
+            }
+
+            $item | Select-Object * -ExcludeProperty RequestId | ConvertTo-Json -depth 100 | Out-File (New-Item -Path $outputFileName -Force)
+        }
+    }
+
     function _processChildrenRecursive {
         param(
             [array]$schemaItems,
             [string]$basePath,
             [array]$parentIds,
-            [ref]$results,
             [ref]$batchRequestStableApi,
             [ref]$batchRequestBetaApi
         )
@@ -318,7 +386,7 @@
         param(
             [ref]$batchRequestStableApi,
             [ref]$batchRequestBetaApi,
-            [ref]$results,
+            [ref]$parentIdIndex,
             [array]$requestedExportSchema
         )
 
@@ -328,7 +396,8 @@
             $batchResults = Invoke-GraphBatchRequest -batchRequest $batchRequestStableApi.Value -separateErrors -ErrorAction SilentlyContinue -ErrorVariable requestErrors -WarningAction SilentlyContinue
 
             if ($batchResults) {
-                $results.Value.AddRange(@($batchResults))
+                # flush to disk immediately and record IDs for parent-child lookups
+                _flushResultsToDisk -batchResults @($batchResults) -parentIdIndex $parentIdIndex.Value
             }
 
             _processBatchErrors -requestErrors $requestErrors -requestedExportSchema $requestedExportSchema
@@ -341,7 +410,8 @@
             $batchResults = Invoke-GraphBatchRequest -batchRequest $batchRequestBetaApi.Value -graphVersion beta -separateErrors -ErrorAction SilentlyContinue -ErrorVariable requestErrors -WarningAction SilentlyContinue
 
             if ($batchResults) {
-                $results.Value.AddRange(@($batchResults))
+                # flush to disk immediately and record IDs for parent-child lookups
+                _flushResultsToDisk -batchResults @($batchResults) -parentIdIndex $parentIdIndex.Value
             }
 
             _processBatchErrors -requestErrors $requestErrors -requestedExportSchema $requestedExportSchema
@@ -350,16 +420,20 @@
     }
     #endregion helper functions
 
-    #region process all schema items recursively
-    $results = [System.Collections.Generic.List[Object]]::new()
+    #region process all schema items one by one
+    # Each root schema item is fully processed (request -> flush to disk -> all children at all
+    # depths) before moving to the next one. $parentIdIndex and $script:childrenToProcess are
+    # reset per root item so lookups stay scoped to the current item's result set.
     $batchRequestStableApi = [System.Collections.Generic.List[Object]]::new()
-    $batchRequestBetaApi = [System.Collections.Generic.List[Object]]::new()
-    $script:childrenToProcess = [System.Collections.Generic.List[Object]]::new()
+    $batchRequestBetaApi   = [System.Collections.Generic.List[Object]]::new()
 
     $requestedExportSchema = $ExportSchema | ? { Compare-Object $_.Tag $Type -ExcludeDifferent -IncludeEqual }
 
-    # process root level items
     foreach ($item in $requestedExportSchema) {
+        # reset per-item state so child lookups don't match results from a previous schema item
+        $parentIdIndex = @{}
+        $script:childrenToProcess = [System.Collections.Generic.List[Object]]::new()
+
         $outputFileName = Join-Path -Path $Path -ChildPath $item.Path
 
         Write-Host "➡️ $($item.GraphUri)"
@@ -369,43 +443,24 @@
             continue
         }
 
-        $command = Get-ObjectProperty $item 'Command'
-        $graphUri = Get-ObjectProperty $item 'GraphUri'
+        $command    = Get-ObjectProperty $item 'Command'
+        $graphUri   = Get-ObjectProperty $item 'GraphUri'
         $apiVersion = Get-ObjectProperty $item 'ApiVersion'
-        $ignoreError = Get-ObjectProperty $item 'IgnoreError'
-        $children = Get-ObjectProperty $item 'Children'
+        $children   = Get-ObjectProperty $item 'Children'
         if (!$apiVersion) { $apiVersion = 'v1.0' }
 
-        if($command) {
+        if ($command) {
             $commandParams = @{}
 
             switch ($command) {
-                'Get-AzureResourceIAMData' {
-                    $commandParams.RootFolder = $outputFileName
-                }
-
-                'Get-AzurePIMDirectoryRoles' {
-                    $commandParams.RootFolder = $outputFileName
-                }
-
-                'Get-AzurePIMResources' {
-                    $commandParams.RootFolder = $outputFileName
-                }
-
-                'Get-AzurePIMGroups' {
-                    $commandParams.RootFolder = $outputFileName
-                }
-
-                'Get-AzureResourceAccessPolicies' {
-                    $commandParams.RootFolder = $outputFileName
-                }
-
-                default {
-                    Write-Warning "Unknown command '$command'"
-                }
+                'Get-AzureResourceIAMData'        { $commandParams.RootFolder = $outputFileName }
+                'Get-AzurePIMDirectoryRoles'      { $commandParams.RootFolder = $outputFileName }
+                'Get-AzurePIMResources'           { $commandParams.RootFolder = $outputFileName }
+                'Get-AzurePIMGroups'              { $commandParams.RootFolder = $outputFileName }
+                'Get-AzureResourceAccessPolicies' { $commandParams.RootFolder = $outputFileName }
+                default { Write-Warning "Unknown command '$command'" }
             }
 
-            # invoke the command with splatting
             & $command @commandParams
         }
         else {
@@ -421,113 +476,51 @@
 
             $request = New-GraphBatchRequest -Url $uri -Id $id -header @{ ConsistencyLevel = 'eventual' }
 
-            if ($apiVersion -eq 'beta') {
-                $batchRequestBetaApi.Add($request)
-            }
-            else {
-                $batchRequestStableApi.Add($request)
-            }
+            if ($apiVersion -eq 'beta') { $batchRequestBetaApi.Add($request) }
+            else                        { $batchRequestStableApi.Add($request) }
+
+            # execute and flush this item's results to disk before processing its children
+            _executeBatchRequests -batchRequestStableApi ([ref]$batchRequestStableApi) -batchRequestBetaApi ([ref]$batchRequestBetaApi) -parentIdIndex ([ref]$parentIdIndex) -requestedExportSchema @($item)
         }
 
-        # track children for later processing
+        # queue children for this item
         if ($children) {
             $script:childrenToProcess.Add(@{
-                Children = $children
-                BasePath = Join-Path -Path $Path -ChildPath $item.Path
+                Children   = $children
+                BasePath   = Join-Path -Path $Path -ChildPath $item.Path
                 ParentPath = $item.Path
             })
         }
-    }
 
-    # execute root level batch requests
-    _executeBatchRequests -batchRequestStableApi ([ref]$batchRequestStableApi) -batchRequestBetaApi ([ref]$batchRequestBetaApi) -results ([ref]$results) -requestedExportSchema $requestedExportSchema
+        # drain all children (and grandchildren) for this item before moving to the next root item
+        while ($script:childrenToProcess.Count -gt 0) {
+            $currentBatch = $script:childrenToProcess
+            $script:childrenToProcess = [System.Collections.Generic.List[Object]]::new()
 
-    # process children recursively
-    while ($script:childrenToProcess.Count -gt 0) {
-        $currentBatch = $script:childrenToProcess
-        $script:childrenToProcess = [System.Collections.Generic.List[Object]]::new()
+            foreach ($childGroup in $currentBatch) {
+                Write-Verbose "Looking for results for parent with path '$($childGroup.ParentPath)'"
 
-        foreach ($childGroup in $currentBatch) {
-            Write-Verbose "Looking for results for parent with path '$($childGroup.ParentPath)'"
+                $basePathNormalized = $childGroup.BasePath -replace "\\", "/"
+                $parentPathPattern  = "$($childGroup.ParentPath)*" -replace "\\", "/"
 
-            $parentResult = $results | Where-Object {
-                $normalizedRequestId = _normalizeRequestId $_.RequestId
-                $normalizedRequestId -eq ($childGroup.BasePath -replace "\\", "/") -or
-                $normalizedRequestId -like ("$($childGroup.ParentPath)*" -replace "\\", "/")
+                # look up parent IDs from the index (keyed by normalized RequestId)
+                $parentIds = $parentIdIndex.Keys | Where-Object {
+                    $_ -eq $basePathNormalized -or $_ -like $parentPathPattern
+                } | ForEach-Object { $parentIdIndex[$_] } | ForEach-Object { $_ } | Select-Object -Unique
+
+                if (!$parentIds) {
+                    Write-Verbose "Parent '$($childGroup.ParentPath)' doesn't contain any data, skipping children retrieval"
+                    continue
+                }
+
+                Write-Verbose "Processing children results for parent '$($childGroup.ParentPath)' ($(@($parentIds).count))"
+
+                _processChildrenRecursive -schemaItems $childGroup.Children -basePath $childGroup.BasePath -parentIds $parentIds -batchRequestStableApi ([ref]$batchRequestStableApi) -batchRequestBetaApi ([ref]$batchRequestBetaApi)
             }
 
-            if (!$parentResult) {
-                Write-Verbose "Parent '$($childGroup.ParentPath)' doesn't contain any data, skipping children retrieval"
-                continue
-            }
-
-            # there can be multiple parent items with same Path, remove duplicates just in case
-            $parentIds = $parentResult.Id | select -Unique
-            Write-Verbose "Processing children results for parent '$($childGroup.ParentPath)' ($($parentIds.count))"
-
-            _processChildrenRecursive -schemaItems $childGroup.Children -basePath $childGroup.BasePath -parentIds $parentIds -results ([ref]$results) -batchRequestStableApi ([ref]$batchRequestStableApi) -batchRequestBetaApi ([ref]$batchRequestBetaApi)
+            # execute and flush this level's child requests to disk immediately
+            _executeBatchRequests -batchRequestStableApi ([ref]$batchRequestStableApi) -batchRequestBetaApi ([ref]$batchRequestBetaApi) -parentIdIndex ([ref]$parentIdIndex) -requestedExportSchema $requestedExportSchema
         }
-
-        # execute batch requests for this level
-        _executeBatchRequests -batchRequestStableApi ([ref]$batchRequestStableApi) -batchRequestBetaApi ([ref]$batchRequestBetaApi) -results ([ref]$results) -requestedExportSchema $requestedExportSchema
     }
-    #endregion process all schema items recursively
-
-    #region output results
-    foreach ($item in $results) {
-        if (!(Get-ObjectProperty $item 'Id')){
-            <#
-            In some special cases it can happen that 'id' property is missing like:
-
-            isEnabled             : True
-            notifyReviewers       : True
-            remindersEnabled      : False
-            requestDurationInDays : 14
-            version               : 0
-            reviewers             : {@{query=/v1.0/groups/b3dbfaaa-4447-4ebe-8d28-c885c851828b/transitiveMembers/microsoft.graph.user; queryType=MicrosoftGraph; queryRoot=}, @{query=/beta/roleManagement/directory/roleAssignments?$filter=roleDefinitionId eq '62e90394-69f5-4237-9190-012177145e10'; queryType=MicrosoftGraph; queryRoot=}}
-            RequestId             : C:/temp/bkp3/Policies/AdminConsentRequestPolicy
-
-            tenantId                     : 6abd85ef-c27c-4e71-b000-4c68074a6f7b
-            isServiceProvider            : True
-            isInMultiTenantOrganization  : False
-            inboundTrust                 :
-            b2bCollaborationOutbound     :
-            b2bCollaborationInbound      :
-            b2bDirectConnectOutbound     :
-            b2bDirectConnectInbound      :
-            tenantRestrictions           :
-            automaticUserConsentSettings : @{inboundAllowed=; outboundAllowed=}
-            RequestId                    : C:/temp/bkp3/Policies/CrossTenantAccessPolicy/Partners
-            #>
-
-            $itemId = ($item.RequestId -split "/")[-1]
-            # remove the random number added to avoid duplicated ids in batch requests
-            $itemId = _normalizeRequestId $itemId
-
-            Write-Verbose ($item | convertto-json -WarningAction SilentlyContinue)
-            Write-Verbose "Result without 'id' property, using '$itemId' instead (RequestId '$($item.RequestId)')!"
-        } else {
-            $itemId = $item.id
-        }
-
-        if (!$item.RequestId) {
-            $item
-            Write-Warning "Item without RequestId. Shouldn't happen!"
-        }
-
-        $outputFileName = $item.RequestId -replace "/", "\"
-        # remove the random number added to avoid duplicated ids in batch requests
-        $outputFileName = _normalizeRequestId $outputFileName
-
-        if ($outputFileName -notmatch "\.json$") {
-            $outputFileName = Join-Path (Join-Path -Path $outputFileName -ChildPath $itemId) -ChildPath "$itemId.json"
-        }
-
-        if (!(Invoke-FilePathCheck -FilePath $outputFileName)) {
-            continue
-        }
-
-        $item | Select-Object * -ExcludeProperty RequestId | ConvertTo-Json -depth 100 | Out-File (New-Item -Path $outputFileName -Force)
-    }
-    #endregion output results
+    #endregion process all schema items one by one
 }
