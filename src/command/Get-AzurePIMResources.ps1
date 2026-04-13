@@ -280,7 +280,7 @@
             continue
         }
 
-        $item | ConvertTo-Json -Depth 100 | Out-File (New-Item -Path $outputFileName -Force)
+        $item | SaveAs-SortedJSON -Path $outputFileName
     }
 
     Get-PIMSubscriptionEligibleAssignment | ? { $_ } | % {
@@ -294,6 +294,6 @@
             continue
         }
 
-        $item | ConvertTo-Json -Depth 100 | Out-File (New-Item -Path $outputFileName -Force)
+        $item | SaveAs-SortedJSON -Path $outputFileName
     }
 }

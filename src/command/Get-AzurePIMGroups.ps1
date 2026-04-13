@@ -133,7 +133,6 @@
             continue
         }
 
-        # Hide warning for depth when converting to JSON
-        $item | ConvertTo-Json -depth 10 -WarningAction SilentlyContinue | Out-File (New-Item -Path $outputFileName -Force)
+        $item | SaveAs-SortedJSON -Path $outputFileName
     }
 }
